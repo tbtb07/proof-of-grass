@@ -1,6 +1,8 @@
 import socket
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template, request
+
+from outdoor_check import check_outdoor
 
 app = Flask(__name__)
 
@@ -18,7 +20,21 @@ def get_local_ip() -> str:
 
 @app.route("/")
 def home():
-    return "Proof of Grass"
+    return render_template("index.html")
+
+
+@app.route("/check", methods=["POST"])
+def check():
+    photo = request.files.get("photo")
+    if photo is None:
+        return jsonify({"error": "No photo uploaded"}), 400
+
+    try:
+        result = check_outdoor(photo.read())
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify(result)
 
 
 @app.route("/status")
