@@ -1,5 +1,6 @@
 // Background service worker for Proof of Grass.
-// Step 2: tracks daily time spent on distracting sites.
+// Tracks daily time spent on distracting sites and blocks them once the
+// daily limit is reached, unless the server says the user is unlocked.
 //
 // The worker can be stopped by Chrome at any moment, so nothing important
 // lives in memory. The current session's start time and today's totals are
@@ -19,6 +20,17 @@ const CHECKPOINT_MINUTES = 0.5; // 30 seconds, the minimum Chrome allows
 // If more time than this passed since the last checkpoint, alarms could not
 // have been firing (computer asleep or Chrome closed), so don't count it.
 const MAX_GAP_MS = 2 * 60 * 1000;
+
+// ===================== DAILY LIMIT =====================
+// TESTING: 60 seconds so we don't have to wait an hour.
+// BEFORE RELEASE: change this back to 60 * 60 (60 minutes).
+const DAILY_LIMIT_SECONDS = 60;
+// =======================================================
+
+const API_BASE_URL = "http://localhost:5050";
+const STATUS_URL = `${API_BASE_URL}/status`;
+const SERVER_TIMEOUT_MS = 3000;
+const BLOCKED_PAGE_URL = chrome.runtime.getURL("blocked.html");
 
 // ---------- Helpers ----------
 
@@ -56,9 +68,9 @@ function emptyUsage(ms) {
   return { date: dateKey(ms), totalSeconds: 0, sites: {} };
 }
 
-// Which tracked site is the user looking at right now? null if none,
-// or if Chrome itself isn't the focused app.
-async function getActiveTrackedSite() {
+// Which tracked site is the user looking at right now? Returns
+// { site, tabId }, or null if none or if Chrome itself isn't the focused app.
+async function getActiveTrackedTab() {
   let win;
   try {
     win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
@@ -67,7 +79,8 @@ async function getActiveTrackedSite() {
   }
   if (!win || !win.focused) return null;
   const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
-  return tab ? trackedSiteFor(tab.url) : null;
+  const site = tab ? trackedSiteFor(tab.url) : null;
+  return site ? { site, tabId: tab.id } : null;
 }
 
 // ---------- Core: credit elapsed time, then start/stop the session ----------
@@ -83,7 +96,8 @@ async function sync(reason) {
   }
 
   const session = stored.session;
-  const activeSite = await getActiveTrackedSite();
+  const activeTab = await getActiveTrackedTab();
+  const activeSite = activeTab ? activeTab.site : null;
   let nextStart = now;
 
   if (session) {
@@ -123,12 +137,64 @@ async function sync(reason) {
   }
 
   await chrome.storage.local.set({ usage, session: nextSession });
+  return { activeTab, totalSeconds: usage.totalSeconds };
 }
 
-// Run syncs one at a time so overlapping events can't overwrite each other.
+// ---------- Daily limit: ask the server, block if locked ----------
+
+// True only if the server clearly says unlocked. Anything else
+// (locked, error, timeout, bad JSON) counts as locked: fail closed.
+async function isUnlocked() {
+  console.log(`Checking server status (${STATUS_URL})`);
+  try {
+    const res = await fetch(STATUS_URL, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(SERVER_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.unlocked === true) {
+      console.log(`Server reports unlocked (until ${data.until})`);
+      return true;
+    }
+    console.log("Server reports locked");
+    return false;
+  } catch (err) {
+    console.log(`Server unreachable - treating as locked (${err.message})`);
+    return false;
+  }
+}
+
+async function enforceLimit(result) {
+  const { activeTab, totalSeconds } = result;
+  if (!activeTab || totalSeconds < DAILY_LIMIT_SECONDS) return;
+
+  console.log(
+    `Daily limit reached (${totalSeconds}s / ${DAILY_LIMIT_SECONDS}s) on ${activeTab.site}`
+  );
+  if (await isUnlocked()) return;
+
+  // The tab may have changed while we waited for the server.
+  let tab;
+  try {
+    tab = await chrome.tabs.get(activeTab.tabId);
+  } catch {
+    return; // tab was closed
+  }
+  if (trackedSiteFor(tab.url) !== activeTab.site) return;
+
+  console.log(`Redirecting ${activeTab.site} to blocked.html`);
+  await chrome.tabs.update(activeTab.tabId, { url: BLOCKED_PAGE_URL });
+}
+
+// Run syncs (and the limit check after each) one at a time so overlapping
+// events can't overwrite each other.
 let queue = Promise.resolve();
 function schedule(reason) {
-  queue = queue.then(() => sync(reason)).catch((err) => console.error(err));
+  queue = queue
+    .then(() => sync(reason))
+    .then(enforceLimit)
+    .catch((err) => console.error(err));
   return queue;
 }
 
@@ -176,7 +242,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 globalThis.showUsage = async () => {
   await schedule("showUsage"); // bring totals up to the current second
   const { usage, session } = await chrome.storage.local.get(["usage", "session"]);
-  console.log(`Date: ${usage.date}   Total: ${usage.totalSeconds}s`);
+  console.log(
+    `Date: ${usage.date}   Total: ${usage.totalSeconds}s / limit ${DAILY_LIMIT_SECONDS}s`
+  );
   console.table(usage.sites);
   console.log("Current session:", session);
   return usage;

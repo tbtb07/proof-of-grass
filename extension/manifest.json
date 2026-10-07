@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Proof of Grass",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Proof of Grass browser extension.",
   "permissions": ["tabs", "storage", "alarms"],
+  "host_permissions": ["http://localhost:5050/*"],
   "background": {
     "service_worker": "background.js"
   }
