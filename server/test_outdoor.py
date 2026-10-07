@@ -1,5 +1,6 @@
 import io
 import json
+import time
 from pathlib import Path
 
 import ollama
@@ -11,6 +12,7 @@ pillow_heif.register_heif_opener()
 MODEL = "gemma3:4b"
 PHOTOS_DIR = Path(__file__).resolve().parent.parent / "test_photos"
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
+TARGET_WIDTH = 1024
 
 PROMPT = (
     "Look at this photo and decide if it was taken outdoors. "
@@ -27,10 +29,13 @@ def find_photos(root: Path):
 
 
 def load_image_bytes(photo_path: Path) -> bytes:
-    if photo_path.suffix.lower() != ".heic":
-        return photo_path.read_bytes()
-
     image = Image.open(photo_path).convert("RGB")
+
+    if image.width > TARGET_WIDTH:
+        ratio = TARGET_WIDTH / image.width
+        new_size = (TARGET_WIDTH, round(image.height * ratio))
+        image = image.resize(new_size, Image.LANCZOS)
+
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG")
     return buffer.getvalue()
@@ -66,18 +71,21 @@ def main():
     total = 0
     for photo in photos:
         expected = expected_outdoor(photo)
+        start = time.perf_counter()
         try:
             result = ask_outdoor(photo)
         except Exception as exc:
-            print(f"{photo}: ERROR - {exc}")
+            elapsed = time.perf_counter() - start
+            print(f"{photo}: ERROR - {exc} ({elapsed:.1f}s)")
             continue
+        elapsed = time.perf_counter() - start
 
         total += 1
         is_correct = result.get("outdoor") == expected
         if is_correct:
             correct += 1
         mark = "✅" if is_correct else "❌"
-        print(f"{mark} {photo}: {result}")
+        print(f"{mark} {photo}: {result} ({elapsed:.1f}s)")
 
     print(f"\n{correct}/{total} correct")
 
