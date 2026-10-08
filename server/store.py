@@ -13,10 +13,13 @@ DEFAULT_SETTINGS = {
     "emergency_minutes": 15,
     "emergency_uses_per_day": 2,
     "password_hash": None,
+    "pending_break_minutes": None,
+    "pending_from": None,
 }
 
 DEFAULT_STATE = {
     "break_started_at": None,
+    "break_minutes_at_start": None,
     "unlocked_until": None,
     "emergency_date": None,
     "emergency_used_today": 0,
@@ -51,6 +54,22 @@ def _settings_defaults() -> dict:
 
 def load_settings() -> dict:
     return _read_json(SETTINGS_PATH, _settings_defaults())
+
+
+def resolve_settings() -> dict:
+    """Loads settings and, if a pending break_minutes change's effective
+    date has arrived, promotes it to the real value and clears the
+    pending fields. Call this instead of load_settings() anywhere a
+    route needs the current settings."""
+    settings = load_settings()
+    pending = settings.get("pending_break_minutes")
+    pending_from = settings.get("pending_from")
+    if pending is not None and pending_from is not None and date_key(now()) >= pending_from:
+        settings["break_minutes"] = pending
+        settings["pending_break_minutes"] = None
+        settings["pending_from"] = None
+        save_settings(settings)
+    return settings
 
 
 def load_state() -> dict:

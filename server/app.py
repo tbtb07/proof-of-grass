@@ -68,14 +68,16 @@ def break_start():
     if not result.get("outdoor"):
         return jsonify({"outdoor": False, "reason": result.get("reason"), "can_end_at": None})
 
-    settings = store.load_settings()
+    settings = store.resolve_settings()
     state = store.load_state()
 
     started_at = store.now()
+    break_minutes = settings["break_minutes"]
     state["break_started_at"] = store.to_iso(started_at)
+    state["break_minutes_at_start"] = break_minutes
     store.save_state(state)
 
-    can_end_at = started_at + timedelta(minutes=settings["break_minutes"])
+    can_end_at = started_at + timedelta(minutes=break_minutes)
     return jsonify({
         "outdoor": True,
         "reason": result.get("reason"),
@@ -90,9 +92,9 @@ def break_end():
     if not started_at_str:
         return jsonify({"error": "No outdoor break in progress"}), 400
 
-    settings = store.load_settings()
+    break_minutes = state.get("break_minutes_at_start")
     started_at = store.from_iso(started_at_str)
-    can_end_at = started_at + timedelta(minutes=settings["break_minutes"])
+    can_end_at = started_at + timedelta(minutes=break_minutes)
     now = store.now()
 
     if now < can_end_at:
@@ -114,8 +116,10 @@ def break_end():
     if not result.get("outdoor"):
         return jsonify({"outdoor": False, "reason": result.get("reason")})
 
+    settings = store.resolve_settings()
     unlocked_until = now + timedelta(minutes=settings["unlock_minutes"])
     state["break_started_at"] = None
+    state["break_minutes_at_start"] = None
     state["unlocked_until"] = store.to_iso(unlocked_until)
     store.save_state(state)
 
@@ -133,13 +137,44 @@ def break_status():
     if not started_at_str:
         return jsonify({"in_progress": False, "started_at": None, "can_end_at": None})
 
-    settings = store.load_settings()
+    break_minutes = state.get("break_minutes_at_start")
     started_at = store.from_iso(started_at_str)
-    can_end_at = started_at + timedelta(minutes=settings["break_minutes"])
+    can_end_at = started_at + timedelta(minutes=break_minutes)
     return jsonify({
         "in_progress": True,
         "started_at": started_at_str,
         "can_end_at": store.to_iso(can_end_at),
+    })
+
+
+@app.route("/settings", methods=["GET"])
+def get_settings():
+    settings = store.resolve_settings()
+    return jsonify({
+        "break_minutes": settings["break_minutes"],
+        "pending_break_minutes": settings.get("pending_break_minutes"),
+        "pending_from": settings.get("pending_from"),
+    })
+
+
+@app.route("/settings", methods=["POST"])
+def post_settings():
+    data = request.get_json(silent=True) or {}
+    value = data.get("break_minutes")
+
+    if not isinstance(value, int) or isinstance(value, bool) or not (5 <= value <= 180):
+        return jsonify({"error": "break_minutes must be a whole number between 5 and 180"}), 400
+
+    settings = store.resolve_settings()
+    tomorrow = store.now() + timedelta(days=1)
+    settings["pending_break_minutes"] = value
+    settings["pending_from"] = store.date_key(tomorrow)
+    store.save_settings(settings)
+
+    return jsonify({
+        "break_minutes": settings["break_minutes"],
+        "pending_break_minutes": settings["pending_break_minutes"],
+        "pending_from": settings["pending_from"],
     })
 
 
@@ -150,7 +185,7 @@ def emergency():
     if not password:
         return jsonify({"error": "Missing password"}), 400
 
-    settings = store.load_settings()
+    settings = store.resolve_settings()
     state = store.load_state()
 
     now = store.now()
