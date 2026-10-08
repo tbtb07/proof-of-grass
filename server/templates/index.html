@@ -23,6 +23,25 @@
       font-size: 1.1rem;
       white-space: pre-wrap;
     }
+    #status {
+      margin-top: 1.5rem;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 0.6rem;
+      font-size: 1.1rem;
+    }
+    .spinner {
+      width: 1.3rem;
+      height: 1.3rem;
+      border: 0.2rem solid #ccc;
+      border-top-color: #2e7d32;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
   </style>
 </head>
 <body>
@@ -32,27 +51,66 @@
   <input type="file" id="photo-input" accept="image/*" capture="environment" hidden>
   <button id="photo-button">Take Photo</button>
 
+  <div id="status">
+    <div class="spinner"></div>
+    <span>Checking with local AI...</span>
+  </div>
   <div id="result"></div>
 
   <script>
+    const MAX_WIDTH = 1024;
+    const JPEG_QUALITY = 0.85;
+
     const input = document.getElementById("photo-input");
     const button = document.getElementById("photo-button");
+    const status = document.getElementById("status");
     const result = document.getElementById("result");
 
     button.addEventListener("click", () => input.click());
+
+    // Draws the photo onto a canvas at a max width of 1024px (keeping aspect
+    // ratio, never upscaling) and returns it as a small JPEG Blob. This way
+    // the upload is tiny and the server doesn't need to resize or handle HEIC.
+    function resizeToJpeg(file) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+          const scale = Math.min(1, MAX_WIDTH / img.width);
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.round(img.width * scale);
+          canvas.height = Math.round(img.height * scale);
+
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+          canvas.toBlob(
+            (blob) => (blob ? resolve(blob) : reject(new Error("Could not create image"))),
+            "image/jpeg",
+            JPEG_QUALITY
+          );
+          URL.revokeObjectURL(img.src);
+        };
+        img.onerror = () => reject(new Error("Could not load photo"));
+        img.src = URL.createObjectURL(file);
+      });
+    }
 
     input.addEventListener("change", async () => {
       const file = input.files[0];
       if (!file) return;
 
-      result.textContent = "Checking...";
-
-      const formData = new FormData();
-      formData.append("photo", file);
+      result.textContent = "";
+      status.style.display = "flex";
 
       try {
+        const jpegBlob = await resizeToJpeg(file);
+
+        const formData = new FormData();
+        formData.append("photo", jpegBlob, "photo.jpg");
+
         const response = await fetch("/check", { method: "POST", body: formData });
         const data = await response.json();
+
         if (!response.ok) {
           result.textContent = `Error: ${data.error || "unknown error"}`;
         } else if (data.outdoor) {
@@ -62,9 +120,10 @@
         }
       } catch (err) {
         result.textContent = `Error: ${err.message}`;
+      } finally {
+        status.style.display = "none";
+        input.value = "";
       }
-
-      input.value = "";
     });
   </script>
 </body>
