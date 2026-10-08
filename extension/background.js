@@ -5,14 +5,11 @@
 // The worker can be stopped by Chrome at any moment, so nothing important
 // lives in memory. The current session's start time and today's totals are
 // kept in chrome.storage.local, and every event recomputes the state.
+//
+// Which sites to limit and the daily limit come from the user's settings
+// (options page), read fresh from storage on every sync.
 
-const TRACKED_SITES = [
-  "youtube.com",
-  "reddit.com",
-  "instagram.com",
-  "tiktok.com",
-  "x.com",
-];
+importScripts("settings.js"); // DEFAULT_SETTINGS, loadSettings()
 
 const CHECKPOINT_ALARM = "checkpoint";
 const CHECKPOINT_MINUTES = 0.5; // 30 seconds, the minimum Chrome allows
@@ -21,12 +18,6 @@ const CHECKPOINT_MINUTES = 0.5; // 30 seconds, the minimum Chrome allows
 // have been firing (computer asleep or Chrome closed), so don't count it.
 const MAX_GAP_MS = 2 * 60 * 1000;
 
-// ===================== DAILY LIMIT =====================
-// TESTING: 60 seconds so we don't have to wait an hour.
-// BEFORE RELEASE: change this back to 60 * 60 (60 minutes).
-const DAILY_LIMIT_SECONDS = 60;
-// =======================================================
-
 const API_BASE_URL = "http://localhost:5050";
 const STATUS_URL = `${API_BASE_URL}/status`;
 const SERVER_TIMEOUT_MS = 3000;
@@ -34,8 +25,9 @@ const BLOCKED_PAGE_URL = chrome.runtime.getURL("blocked.html");
 
 // ---------- Helpers ----------
 
-// Returns the tracked site for a URL, e.g. "https://m.youtube.com/x" -> "youtube.com".
-function trackedSiteFor(url) {
+// Returns which of `sites` a URL belongs to,
+// e.g. "https://m.youtube.com/x" -> "youtube.com".
+function trackedSiteFor(url, sites) {
   if (!url) return null;
   let parsed;
   try {
@@ -46,7 +38,7 @@ function trackedSiteFor(url) {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
   const host = parsed.hostname;
   return (
-    TRACKED_SITES.find((site) => host === site || host.endsWith("." + site)) ||
+    sites.find((site) => host === site || host.endsWith("." + site)) ||
     null
   );
 }
@@ -68,9 +60,19 @@ function emptyUsage(ms) {
   return { date: dateKey(ms), totalSeconds: 0, sites: {} };
 }
 
+// The daily limit in seconds. A test override (setTestLimit) wins over the
+// user's dailyLimitMinutes without changing their saved settings.
+function limitFor(settings, devLimitSeconds) {
+  if (Number.isInteger(devLimitSeconds) && devLimitSeconds > 0) {
+    return { seconds: devLimitSeconds, label: `${devLimitSeconds}s TEST LIMIT` };
+  }
+  const seconds = settings.dailyLimitMinutes * 60;
+  return { seconds, label: `${seconds}s (${settings.dailyLimitMinutes} min)` };
+}
+
 // Which tracked site is the user looking at right now? Returns
 // { site, tabId }, or null if none or if Chrome itself isn't the focused app.
-async function getActiveTrackedTab() {
+async function getActiveTrackedTab(sites) {
   let win;
   try {
     win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
@@ -79,7 +81,7 @@ async function getActiveTrackedTab() {
   }
   if (!win || !win.focused) return null;
   const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
-  const site = tab ? trackedSiteFor(tab.url) : null;
+  const site = tab ? trackedSiteFor(tab.url, sites) : null;
   return site ? { site, tabId: tab.id } : null;
 }
 
@@ -87,7 +89,13 @@ async function getActiveTrackedTab() {
 
 async function sync(reason) {
   const now = Date.now();
-  const stored = await chrome.storage.local.get(["usage", "session"]);
+  const stored = await chrome.storage.local.get([
+    "usage",
+    "session",
+    "devLimitSeconds",
+  ]);
+  const settings = await loadSettings();
+  const sites = settings.blockedSites;
 
   let usage = stored.usage;
   if (!usage || usage.date !== dateKey(now)) {
@@ -96,7 +104,7 @@ async function sync(reason) {
   }
 
   const session = stored.session;
-  const activeTab = await getActiveTrackedTab();
+  const activeTab = await getActiveTrackedTab(sites);
   const activeSite = activeTab ? activeTab.site : null;
   let nextStart = now;
 
@@ -137,7 +145,12 @@ async function sync(reason) {
   }
 
   await chrome.storage.local.set({ usage, session: nextSession });
-  return { activeTab, totalSeconds: usage.totalSeconds };
+  return {
+    activeTab,
+    totalSeconds: usage.totalSeconds,
+    sites,
+    limit: limitFor(settings, stored.devLimitSeconds),
+  };
 }
 
 // ---------- Daily limit: ask the server, block if locked ----------
@@ -166,11 +179,11 @@ async function isUnlocked() {
 }
 
 async function enforceLimit(result) {
-  const { activeTab, totalSeconds } = result;
-  if (!activeTab || totalSeconds < DAILY_LIMIT_SECONDS) return;
+  const { activeTab, totalSeconds, sites, limit } = result;
+  if (!activeTab || totalSeconds < limit.seconds) return;
 
   console.log(
-    `Daily limit reached (${totalSeconds}s / ${DAILY_LIMIT_SECONDS}s) on ${activeTab.site}`
+    `Daily limit reached (${totalSeconds}s / ${limit.label}) on ${activeTab.site}`
   );
   if (await isUnlocked()) return;
 
@@ -181,7 +194,7 @@ async function enforceLimit(result) {
   } catch {
     return; // tab was closed
   }
-  if (trackedSiteFor(tab.url) !== activeTab.site) return;
+  if (trackedSiteFor(tab.url, sites) !== activeTab.site) return;
 
   console.log(`Redirecting ${activeTab.site} to blocked.html`);
   await chrome.tabs.update(activeTab.tabId, { url: BLOCKED_PAGE_URL });
@@ -209,9 +222,22 @@ async function ensureAlarm() {
 
 // ---------- Events ----------
 
-chrome.runtime.onInstalled.addListener((details) => {
+chrome.runtime.onInstalled.addListener(async (details) => {
   console.log("Proof of Grass installed:", details.reason);
   ensureAlarm();
+
+  // Only a genuine first install sets defaults and opens the setup page.
+  // Updates and reloads ("update") keep the user's settings untouched.
+  if (details.reason === "install") {
+    const { settings } = await chrome.storage.local.get("settings");
+    if (!settings) {
+      await chrome.storage.local.set({ settings: DEFAULT_SETTINGS });
+      console.log("Saved default settings.");
+    }
+    console.log("First install: opening setup page.");
+    chrome.runtime.openOptionsPage();
+  }
+
   schedule("installed");
 });
 
@@ -236,18 +262,55 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === CHECKPOINT_ALARM) schedule("checkpoint");
 });
 
+// Apply new settings right away (e.g. a site was unchecked, the limit
+// lowered). Only reacts to settings, not to our own usage/session writes.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes.settings) {
+    console.log("Settings changed:", changes.settings.newValue);
+    schedule("settings changed");
+  } else if (changes.devLimitSeconds) {
+    schedule("test limit changed");
+  }
+});
+
 // ---------- Testing helpers (type these in the service worker console) ----------
 
 // showUsage()  -> prints today's seconds per site
 globalThis.showUsage = async () => {
   await schedule("showUsage"); // bring totals up to the current second
-  const { usage, session } = await chrome.storage.local.get(["usage", "session"]);
+  const { usage, session, devLimitSeconds } = await chrome.storage.local.get([
+    "usage",
+    "session",
+    "devLimitSeconds",
+  ]);
+  const settings = await loadSettings();
+  const limit = limitFor(settings, devLimitSeconds);
   console.log(
-    `Date: ${usage.date}   Total: ${usage.totalSeconds}s / limit ${DAILY_LIMIT_SECONDS}s`
+    `Date: ${usage.date}   Total: ${usage.totalSeconds}s / limit ${limit.label}`
   );
   console.table(usage.sites);
   console.log("Current session:", session);
+  console.log("Blocked sites:", settings.blockedSites);
   return usage;
+};
+
+// setTestLimit(60) -> use a 60-second limit for testing. Does NOT change the
+// user's saved dailyLimitMinutes. Stays until clearTestLimit().
+globalThis.setTestLimit = async (seconds = 60) => {
+  if (!Number.isInteger(seconds) || seconds < 1) {
+    console.log("setTestLimit needs a whole number of seconds, e.g. setTestLimit(60)");
+    return;
+  }
+  await chrome.storage.local.set({ devLimitSeconds: seconds });
+  console.log(`TEST LIMIT ON: ${seconds}s. Run clearTestLimit() to go back to normal.`);
+};
+
+// clearTestLimit() -> back to the user's real dailyLimitMinutes
+globalThis.clearTestLimit = async () => {
+  await chrome.storage.local.remove("devLimitSeconds");
+  const settings = await loadSettings();
+  console.log(`Test limit off. Using ${settings.dailyLimitMinutes} min from settings.`);
 };
 
 // resetUsage() -> clears today's numbers
