@@ -4,16 +4,22 @@ from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 SETTINGS_PATH = DATA_DIR / "settings.json"
+SETTINGS_EXAMPLE_PATH = DATA_DIR / "settings.example.json"
 STATE_PATH = DATA_DIR / "state.json"
 
 DEFAULT_SETTINGS = {
     "break_minutes": 20,
     "unlock_minutes": 60,
+    "emergency_minutes": 15,
+    "emergency_uses_per_day": 2,
+    "password_hash": None,
 }
 
 DEFAULT_STATE = {
     "break_started_at": None,
     "unlocked_until": None,
+    "emergency_date": None,
+    "emergency_used_today": 0,
 }
 
 
@@ -32,8 +38,19 @@ def _write_json(path: Path, data: dict):
         json.dump(data, f, indent=2)
 
 
+def _settings_defaults() -> dict:
+    """What to write to settings.json the first time it's needed. Prefers
+    settings.example.json (tracked in git) over the hardcoded defaults, so
+    a fresh clone starts from the same template everyone commits to."""
+    if SETTINGS_EXAMPLE_PATH.exists():
+        with SETTINGS_EXAMPLE_PATH.open() as f:
+            example = json.load(f)
+        return {**DEFAULT_SETTINGS, **example}
+    return dict(DEFAULT_SETTINGS)
+
+
 def load_settings() -> dict:
-    return _read_json(SETTINGS_PATH, DEFAULT_SETTINGS)
+    return _read_json(SETTINGS_PATH, _settings_defaults())
 
 
 def load_state() -> dict:
@@ -42,6 +59,10 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     _write_json(STATE_PATH, state)
+
+
+def save_settings(settings: dict):
+    _write_json(SETTINGS_PATH, settings)
 
 
 def now() -> datetime:
@@ -56,3 +77,7 @@ def to_iso(dt: datetime) -> str:
 
 def from_iso(s: str) -> datetime:
     return datetime.fromisoformat(s)
+
+
+def date_key(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")

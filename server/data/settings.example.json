@@ -1,0 +1,7 @@
+{
+  "break_minutes": 20,
+  "unlock_minutes": 60,
+  "emergency_minutes": 15,
+  "emergency_uses_per_day": 2,
+  "password_hash": null
+}

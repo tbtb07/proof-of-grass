@@ -3,6 +3,7 @@ import time
 from datetime import timedelta
 
 from flask import Flask, jsonify, render_template, request
+from werkzeug.security import check_password_hash
 
 import store
 from outdoor_check import ask_gemma, prepare_image_bytes, warm_up
@@ -139,6 +140,55 @@ def break_status():
         "in_progress": True,
         "started_at": started_at_str,
         "can_end_at": store.to_iso(can_end_at),
+    })
+
+
+@app.route("/emergency", methods=["POST"])
+def emergency():
+    data = request.get_json(silent=True) or {}
+    password = data.get("password")
+    if not password:
+        return jsonify({"error": "Missing password"}), 400
+
+    settings = store.load_settings()
+    state = store.load_state()
+
+    now = store.now()
+    today = store.date_key(now)
+    if state.get("emergency_date") != today:
+        state["emergency_date"] = today
+        state["emergency_used_today"] = 0
+
+    used = state["emergency_used_today"]
+    limit = settings["emergency_uses_per_day"]
+    remaining = max(limit - used, 0)
+
+    if remaining <= 0:
+        store.save_state(state)
+        return jsonify({
+            "ok": False,
+            "error": "No emergency unlocks left today",
+            "remaining_today": 0,
+        })
+
+    password_hash = settings.get("password_hash")
+    if not password_hash or not check_password_hash(password_hash, password):
+        store.save_state(state)  # keep any date-rollover reset even on a wrong guess
+        return jsonify({
+            "ok": False,
+            "error": "Wrong password",
+            "remaining_today": remaining,
+        })
+
+    state["emergency_used_today"] = used + 1
+    unlocked_until = now + timedelta(minutes=settings["emergency_minutes"])
+    state["unlocked_until"] = store.to_iso(unlocked_until)
+    store.save_state(state)
+
+    return jsonify({
+        "ok": True,
+        "until": store.to_iso(unlocked_until),
+        "remaining_today": limit - state["emergency_used_today"],
     })
 
 
