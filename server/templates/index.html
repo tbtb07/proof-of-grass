@@ -18,7 +18,11 @@
       background: #2e7d32;
       color: white;
     }
-    #result {
+    #countdown {
+      font-size: 1.6rem;
+      margin: 1rem 0;
+    }
+    #message {
       margin-top: 1.5rem;
       font-size: 1.1rem;
       white-space: pre-wrap;
@@ -42,35 +46,95 @@
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
+    .hidden {
+      display: none;
+    }
   </style>
 </head>
 <body>
   <h1>Proof of Grass</h1>
-  <p>Take a photo to check if you're outside.</p>
+
+  <div id="start-section">
+    <p>Take a photo outside to start your outdoor break.</p>
+    <button id="start-button">Start outdoor break</button>
+  </div>
+
+  <div id="progress-section" class="hidden">
+    <p>Outdoor break in progress.</p>
+    <div id="countdown"></div>
+    <button id="finish-button" class="hidden">Finish outdoor break</button>
+  </div>
+
+  <div id="unlocked-section" class="hidden">
+    <p id="unlocked-message"></p>
+  </div>
 
   <input type="file" id="photo-input" accept="image/*" capture="environment" hidden>
-  <button id="photo-button">Take Photo</button>
 
   <div id="status">
     <div class="spinner"></div>
     <span>Checking with local AI...</span>
   </div>
-  <div id="result"></div>
+  <div id="message"></div>
 
   <script>
     const MAX_WIDTH = 1024;
     const JPEG_QUALITY = 0.85;
 
     const input = document.getElementById("photo-input");
-    const button = document.getElementById("photo-button");
+    const startSection = document.getElementById("start-section");
+    const startButton = document.getElementById("start-button");
+    const progressSection = document.getElementById("progress-section");
+    const countdownEl = document.getElementById("countdown");
+    const finishButton = document.getElementById("finish-button");
+    const unlockedSection = document.getElementById("unlocked-section");
+    const unlockedMessage = document.getElementById("unlocked-message");
     const status = document.getElementById("status");
-    const result = document.getElementById("result");
+    const message = document.getElementById("message");
 
-    button.addEventListener("click", () => input.click());
+    let mode = null; // "start" or "end" - which endpoint the next photo goes to
+    let countdownTimer = null;
+
+    function showSection(section) {
+      startSection.classList.add("hidden");
+      progressSection.classList.add("hidden");
+      unlockedSection.classList.add("hidden");
+      section.classList.remove("hidden");
+    }
+
+    function formatTime(iso) {
+      return new Date(iso).toLocaleTimeString();
+    }
+
+    // Counts down to canEndAt, then swaps the countdown text for the
+    // "Finish outdoor break" button.
+    function startCountdown(canEndAt) {
+      clearInterval(countdownTimer);
+      finishButton.classList.add("hidden");
+      countdownEl.classList.remove("hidden");
+
+      const target = new Date(canEndAt).getTime();
+
+      function tick() {
+        const remainingMs = target - Date.now();
+        if (remainingMs <= 0) {
+          clearInterval(countdownTimer);
+          countdownEl.classList.add("hidden");
+          finishButton.classList.remove("hidden");
+          return;
+        }
+        const totalSeconds = Math.ceil(remainingMs / 1000);
+        const mm = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+        const ss = String(totalSeconds % 60).padStart(2, "0");
+        countdownEl.textContent = `End photo allowed in ${mm}:${ss}`;
+      }
+
+      tick();
+      countdownTimer = setInterval(tick, 1000);
+    }
 
     // Draws the photo onto a canvas at a max width of 1024px (keeping aspect
-    // ratio, never upscaling) and returns it as a small JPEG Blob. This way
-    // the upload is tiny and the server doesn't need to resize or handle HEIC.
+    // ratio, never upscaling) and returns it as a small JPEG Blob.
     function resizeToJpeg(file) {
       return new Promise((resolve, reject) => {
         const img = new Image();
@@ -95,36 +159,74 @@
       });
     }
 
+    async function refreshBreakStatus() {
+      const res = await fetch("/break/status", { cache: "no-store" });
+      const data = await res.json();
+      if (data.in_progress) {
+        showSection(progressSection);
+        startCountdown(data.can_end_at);
+      } else {
+        showSection(startSection);
+      }
+    }
+
+    startButton.addEventListener("click", () => {
+      mode = "start";
+      input.click();
+    });
+
+    finishButton.addEventListener("click", () => {
+      mode = "end";
+      input.click();
+    });
+
     input.addEventListener("change", async () => {
       const file = input.files[0];
       if (!file) return;
 
-      result.textContent = "";
+      message.textContent = "";
       status.style.display = "flex";
 
       try {
         const jpegBlob = await resizeToJpeg(file);
-
         const formData = new FormData();
         formData.append("photo", jpegBlob, "photo.jpg");
 
-        const response = await fetch("/check", { method: "POST", body: formData });
+        const url = mode === "start" ? "/break/start" : "/break/end";
+        const response = await fetch(url, { method: "POST", body: formData });
         const data = await response.json();
 
         if (!response.ok) {
-          result.textContent = `Error: ${data.error || "unknown error"}`;
-        } else if (data.outdoor) {
-          result.textContent = `✅ Outdoor\n${data.reason}`;
-        } else {
-          result.textContent = `❌ Not outdoor\n${data.reason}`;
+          // Server is authoritative on timing - if we somehow asked too
+          // early, re-sync with it instead of trusting our own countdown.
+          message.textContent = `Error: ${data.error || "unknown error"}`;
+          await refreshBreakStatus();
+        } else if (mode === "start") {
+          if (data.outdoor) {
+            message.textContent = `✅ ${data.reason}`;
+            showSection(progressSection);
+            startCountdown(data.can_end_at);
+          } else {
+            message.textContent = `❌ ${data.reason}`;
+          }
+        } else if (mode === "end") {
+          if (data.outdoor) {
+            message.textContent = "";
+            unlockedMessage.textContent = `Unlocked until ${formatTime(data.unlocked_until)}`;
+            showSection(unlockedSection);
+          } else {
+            message.textContent = `❌ ${data.reason}`;
+          }
         }
       } catch (err) {
-        result.textContent = `Error: ${err.message}`;
+        message.textContent = `Error: ${err.message}`;
       } finally {
         status.style.display = "none";
         input.value = "";
       }
     });
+
+    refreshBreakStatus();
   </script>
 </body>
 </html>

@@ -222,3 +222,4 @@ __marimo__/
 # Project-specific
 test_photos/
 .DS_Store
+server/data/state.json

@@ -1,8 +1,10 @@
 import socket
 import time
+from datetime import timedelta
 
 from flask import Flask, jsonify, render_template, request
 
+import store
 from outdoor_check import ask_gemma, prepare_image_bytes, warm_up
 
 app = Flask(__name__)
@@ -51,11 +53,115 @@ def check():
     return jsonify(result)
 
 
+@app.route("/break/start", methods=["POST"])
+def break_start():
+    photo = request.files.get("photo")
+    if photo is None:
+        return jsonify({"error": "No photo uploaded"}), 400
+
+    try:
+        result = ask_gemma(prepare_image_bytes(photo.read()))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    if not result.get("outdoor"):
+        return jsonify({"outdoor": False, "reason": result.get("reason"), "can_end_at": None})
+
+    settings = store.load_settings()
+    state = store.load_state()
+
+    started_at = store.now()
+    state["break_started_at"] = store.to_iso(started_at)
+    store.save_state(state)
+
+    can_end_at = started_at + timedelta(minutes=settings["break_minutes"])
+    return jsonify({
+        "outdoor": True,
+        "reason": result.get("reason"),
+        "can_end_at": store.to_iso(can_end_at),
+    })
+
+
+@app.route("/break/end", methods=["POST"])
+def break_end():
+    state = store.load_state()
+    started_at_str = state.get("break_started_at")
+    if not started_at_str:
+        return jsonify({"error": "No outdoor break in progress"}), 400
+
+    settings = store.load_settings()
+    started_at = store.from_iso(started_at_str)
+    can_end_at = started_at + timedelta(minutes=settings["break_minutes"])
+    now = store.now()
+
+    if now < can_end_at:
+        minutes_left = (can_end_at - now).total_seconds() / 60
+        return jsonify({
+            "error": "Too early to finish the outdoor break",
+            "minutes_left": round(minutes_left, 1),
+        }), 400
+
+    photo = request.files.get("photo")
+    if photo is None:
+        return jsonify({"error": "No photo uploaded"}), 400
+
+    try:
+        result = ask_gemma(prepare_image_bytes(photo.read()))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    if not result.get("outdoor"):
+        return jsonify({"outdoor": False, "reason": result.get("reason")})
+
+    unlocked_until = now + timedelta(minutes=settings["unlock_minutes"])
+    state["break_started_at"] = None
+    state["unlocked_until"] = store.to_iso(unlocked_until)
+    store.save_state(state)
+
+    return jsonify({
+        "outdoor": True,
+        "reason": result.get("reason"),
+        "unlocked_until": store.to_iso(unlocked_until),
+    })
+
+
+@app.route("/break/status")
+def break_status():
+    state = store.load_state()
+    started_at_str = state.get("break_started_at")
+    if not started_at_str:
+        return jsonify({"in_progress": False, "started_at": None, "can_end_at": None})
+
+    settings = store.load_settings()
+    started_at = store.from_iso(started_at_str)
+    can_end_at = started_at + timedelta(minutes=settings["break_minutes"])
+    return jsonify({
+        "in_progress": True,
+        "started_at": started_at_str,
+        "can_end_at": store.to_iso(can_end_at),
+    })
+
+
 @app.route("/status")
 def status():
+    state = store.load_state()
+    unlocked_until_str = state.get("unlocked_until")
+    unlocked = False
+    until = None
+
+    if unlocked_until_str:
+        unlocked_until = store.from_iso(unlocked_until_str)
+        if store.now() < unlocked_until:
+            unlocked = True
+            until = unlocked_until_str
+        else:
+            # Unlock window passed: clear it so state.json doesn't stay stale.
+            state["unlocked_until"] = None
+            store.save_state(state)
+
     return jsonify({
-        "unlocked": False,
-        "until": None,
+        "unlocked": unlocked,
+        "until": until,
         "phone_url": f"http://{get_local_ip()}:5050",
     })
 
