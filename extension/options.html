@@ -94,6 +94,11 @@
     #saveStatus.saved { color: var(--accent); }
     #saveStatus.unsaved { color: var(--muted); font-weight: 400; }
     #saveStatus.invalid { color: var(--error); }
+    .break-info { margin: 10px 0 0; font-size: 14px; }
+    .break-info[hidden] { display: none; }
+    #breakCurrent { font-weight: 600; }
+    #breakPending { color: var(--accent); }
+    #breakOffline { color: var(--error); }
   </style>
 </head>
 <body>
@@ -126,6 +131,19 @@
         <span>minutes per day</span>
       </div>
       <p class="error" id="limitError" role="alert"></p>
+    </section>
+
+    <section>
+      <h2>Outdoor break length</h2>
+      <p class="hint">How long you need to spend outside to unlock your blocked websites.</p>
+      <div class="limit">
+        <input type="number" id="breakInput" min="5" max="180" step="1" aria-label="Outdoor break minutes" disabled>
+        <span>minutes</span>
+      </div>
+      <p class="error" id="breakError" role="alert"></p>
+      <p class="break-info" id="breakCurrent" aria-live="polite">Loading from the server…</p>
+      <p class="break-info" id="breakPending" aria-live="polite" hidden></p>
+      <p class="break-info" id="breakOffline" role="alert" hidden>Start the server to change break length.</p>
     </section>
 
     <div class="save">
