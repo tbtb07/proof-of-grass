@@ -196,8 +196,11 @@ async function enforceLimit(result) {
   }
   if (trackedSiteFor(tab.url, sites) !== activeTab.site) return;
 
+  // Pass the original URL along so blocked.html can send the user back
+  // there once they're unlocked.
   console.log(`Redirecting ${activeTab.site} to blocked.html`);
-  await chrome.tabs.update(activeTab.tabId, { url: BLOCKED_PAGE_URL });
+  const blockedUrl = `${BLOCKED_PAGE_URL}?from=${encodeURIComponent(tab.url)}`;
+  await chrome.tabs.update(activeTab.tabId, { url: blockedUrl });
 }
 
 // Run syncs (and the limit check after each) one at a time so overlapping
