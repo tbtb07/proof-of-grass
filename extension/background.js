@@ -28,6 +28,13 @@ const BADGE_ORANGE = "#f57c00"; // 1–5 minutes left
 const BADGE_RED = "#c62828"; // limit reached
 const BADGE_WARNING_SECONDS = 5 * 60;
 
+const WARNING_SECONDS = 5 * 60;
+const WARNING_NOTIFICATION_ID = "five-minute-warning";
+const WARNING_TITLE = "Proof of Grass — 5 Minutes Left!";
+const WARNING_MESSAGE =
+  "You have 5 minutes of screen time remaining today. " +
+  "Finish up before your websites are blocked!";
+
 // ---------- Helpers ----------
 
 // Returns which of `sites` a URL belongs to,
@@ -69,10 +76,18 @@ function emptyUsage(ms) {
 // user's dailyLimitMinutes without changing their saved settings.
 function limitFor(settings, devLimitSeconds) {
   if (Number.isInteger(devLimitSeconds) && devLimitSeconds > 0) {
-    return { seconds: devLimitSeconds, label: `${devLimitSeconds}s TEST LIMIT` };
+    return {
+      seconds: devLimitSeconds,
+      label: `${devLimitSeconds}s TEST LIMIT`,
+      isTest: true,
+    };
   }
   const seconds = settings.dailyLimitMinutes * 60;
-  return { seconds, label: `${seconds}s (${settings.dailyLimitMinutes} min)` };
+  return {
+    seconds,
+    label: `${seconds}s (${settings.dailyLimitMinutes} min)`,
+    isTest: false,
+  };
 }
 
 // Which tracked site is the user looking at right now? Returns
@@ -107,6 +122,8 @@ async function sync(reason) {
     if (usage) console.log(`New day: resetting usage (was ${usage.date}).`);
     usage = emptyUsage(now);
   }
+  // Today's total before this update adds time (for the 5-minute warning).
+  const previousSeconds = usage.totalSeconds;
 
   const session = stored.session;
   const activeTab = await getActiveTrackedTab(sites);
@@ -153,6 +170,8 @@ async function sync(reason) {
   return {
     reason,
     activeTab,
+    date: usage.date,
+    previousSeconds,
     totalSeconds: usage.totalSeconds,
     sites,
     limit: limitFor(settings, stored.devLimitSeconds),
@@ -255,7 +274,61 @@ async function updateBadge(result) {
   await chrome.action.setBadgeBackgroundColor({ color });
 }
 
-// Run syncs (then the limit check and badge update after each) one at a
+// ---------- Five-minute warning notification ----------
+
+// Shows the warning once per day, only when tracked time actually pushes the
+// remaining time from above 5:00 to 5:00 or less (but not to 0). Both totals
+// are compared against the same current limit, so changing the limit or
+// turning on a test limit can never trigger it by itself.
+async function maybeWarn(result) {
+  const { date, previousSeconds, totalSeconds, limit } = result;
+  const before = limit.seconds - previousSeconds;
+  const after = limit.seconds - totalSeconds;
+  if (!(before > WARNING_SECONDS && after <= WARNING_SECONDS && after > 0)) return;
+
+  const { unlockedUntil = 0 } = await chrome.storage.session.get("unlockedUntil");
+  if (unlockedUntil > Date.now()) return; // unlocked: nothing is about to be blocked
+
+  // Test limits keep their own "already warned" date so testing never uses
+  // up the real warning.
+  const key = limit.isTest ? "lastTestWarningDate" : "lastWarningDate";
+  const stored = await chrome.storage.local.get(key);
+  if (stored[key] === date) return;
+
+  // Record first so a failure or restart can never lead to a second warning.
+  await chrome.storage.local.set({ [key]: date });
+  await showWarning();
+  console.log(`Five-minute warning shown (${after}s left${limit.isTest ? ", test limit" : ""}).`);
+}
+
+async function showWarning() {
+  await chrome.notifications.create(WARNING_NOTIFICATION_ID, {
+    type: "basic",
+    iconUrl: await warningIconUrl(),
+    title: WARNING_TITLE,
+    message: WARNING_MESSAGE,
+    priority: 2,
+  });
+}
+
+// The extension has no icon files yet, and Chrome requires an icon for a
+// notification, so draw a simple green circle. Replace with a real icon file
+// once the extension has one.
+async function warningIconUrl() {
+  const canvas = new OffscreenCanvas(128, 128);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = BADGE_GREEN;
+  ctx.beginPath();
+  ctx.arc(64, 64, 60, 0, Math.PI * 2);
+  ctx.fill();
+  const blob = await canvas.convertToBlob({ type: "image/png" });
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return `data:image/png;base64,${btoa(binary)}`;
+}
+
+// Run syncs (then the limit check, badge and warning after each) one at a
 // time so overlapping events can't overwrite each other.
 let queue = Promise.resolve();
 function schedule(reason) {
@@ -266,6 +339,8 @@ function schedule(reason) {
         await enforceLimit(result);
       } finally {
         await updateBadge(result);
+        // The warning must never break blocking or the badge.
+        await maybeWarn(result).catch((err) => console.error("Warning failed:", err));
       }
     })
     .catch((err) => console.error(err));
@@ -365,15 +440,24 @@ globalThis.setTestLimit = async (seconds = 60) => {
     console.log("setTestLimit needs a whole number of seconds, e.g. setTestLimit(60)");
     return;
   }
+  // Fresh test warning each time; the real lastWarningDate is never touched.
+  await chrome.storage.local.remove("lastTestWarningDate");
   await chrome.storage.local.set({ devLimitSeconds: seconds });
   console.log(`TEST LIMIT ON: ${seconds}s. Run clearTestLimit() to go back to normal.`);
 };
 
 // clearTestLimit() -> back to the user's real dailyLimitMinutes
 globalThis.clearTestLimit = async () => {
-  await chrome.storage.local.remove("devLimitSeconds");
+  await chrome.storage.local.remove(["devLimitSeconds", "lastTestWarningDate"]);
   const settings = await loadSettings();
   console.log(`Test limit off. Using ${settings.dailyLimitMinutes} min from settings.`);
+};
+
+// testWarning() -> shows the 5-minute notification right now. Preview only:
+// it doesn't record anything, so today's real warning still works.
+globalThis.testWarning = async () => {
+  await showWarning();
+  console.log("Test notification shown (nothing recorded).");
 };
 
 // resetUsage() -> clears today's numbers

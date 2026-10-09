@@ -15,9 +15,16 @@ Chrome Manifest V3 extension in `extension/`. Talks to the Flask server at `http
   - *Unlock state*: `isUnlocked()` already asks `/status` when over the limit on a limited site; it now also saves when the unlock ends (`unlockedUntil`) in `chrome.storage.session` (survives worker restarts, cleared when Chrome closes). The badge is hidden while that time is in the future and comes back at the next update after it passes, with no extra request. An unreachable server is saved as "not unlocked", so it never hides the badge. While over the limit but not on a limited site, the existing checkpoint also refreshes `/status` (at most once per 30 s) so an unlock started from the phone hides the badge.
   - `manifest.json` gained `"action": { "default_title": "Proof of Grass" }` because `chrome.action` only exists when the manifest declares an action. That key isn't a permission and doesn't add an install warning.
 
+- **Five-minute warning** (`background.js`, `maybeWarn`): a Chrome notification "Proof of Grass — 5 Minutes Left!" when tracked time pushes remaining time from **above 5:00 to 5:00 or less** (5:30 → none, 5:01 → 5:00 fires, 4:59 after 5:00 doesn't). Runs as the last step of the existing update queue (`sync` → `enforceLimit` → `updateBadge` → `maybeWarn`), so there is no new timer; errors in it are caught so blocking and the badge are never affected. Needs the `notifications` permission.
+  - *Crossing, not level*: `sync()` passes today's total before and after this update's time; both are compared against the same current limit. Changing the daily limit or turning on a test limit adds no time, so it can't trigger a warning. Jumping straight to 0 doesn't fire, and nothing fires during an active unlock (same `unlockedUntil` the badge uses).
+  - *One per day*: `lastWarningDate: "YYYY-MM-DD"` in `chrome.storage.local` (survives Chrome restarts) is saved before the notification is shown; a matching date skips it. A new local date allows the next one. The fixed notification ID means even a repeat would replace, not stack.
+  - *Testing*: while a test limit is on, the date is kept in `lastTestWarningDate` instead, which `setTestLimit()`/`clearTestLimit()` clear, so tests never use up the real warning. `testWarning()` previews the notification without recording anything.
+  - *Icon*: the extension has no icon files yet and Chrome requires one for notifications, so a plain green circle is drawn at runtime (`OffscreenCanvas` → PNG data URL). Swap for `icons/icon128.png` once real icons are added.
+
 ### Testing helpers (service worker console)
 - `showUsage()`, `resetUsage()`
 - `setTestLimit(60)` → 60-second limit without changing the user's saved minutes; `clearTestLimit()` to go back.
+- `testWarning()` → show the 5-minute notification now (records nothing). For a real crossing test use `setTestLimit(330)` (must be above 300 s), then use a limited site for ~30–60 s.
 - `extension/mock_server.py` is a standard-library stand-in for `/status` (used in early steps). Use the real server for integration tests.
 - Lightweight real server without Ollama/Gemma (skips the warm-up in `__main__`):
   `.venv/bin/python -c "import sys; sys.path.insert(0, 'server'); from app import app; app.run(host='127.0.0.1', port=5050)"`
@@ -65,6 +72,27 @@ Automated in headless Chrome. Server tests used a temporary copy of the extensio
 | J. Server unreachable | Stays "0" red; remembered unlock = 0 |
 | K. Tracking + blocking | Time still credited per site; over-limit site still redirected; badge follows. Test limit on/off updates the badge |
 
+### Five-minute warning: test results
+Automated in headless Chrome against a temp copy of the extension pointed at port 5051 (no server needed), so real server data and the real `lastWarningDate` were never touched. Time was added by setting a session start in the past and running the normal update queue. 33/33 checks passed.
+
+| Test | Result |
+|---|---|
+| A. 10m30 → 10m left | No notification |
+| B. 6m → 5m30 left | No notification |
+| C. 5m10 → 4m50 left | Exactly one; `lastWarningDate` = today; notification present in Chrome |
+| Boundaries | 5:01 → 5:00 fires; 5:31 → 5:00 fires; 5:30 → 5:01 doesn't; 5:00 → 4:59 doesn't (never above 5:00) |
+| D. 3 min left | No duplicate |
+| E. Tab / window switch | No duplicate, even when the switch itself crossed 5:00 again |
+| F. Extension reload + startup event | `lastWarningDate` survived; no duplicate |
+| G. New day (last warned yesterday) | Fires again |
+| H. Limit 60 → 55 (6:39 → 1:39 left) | No warning, and none on further usage that day |
+| I. `setTestLimit(300)`, 0 used | No immediate warning; 330 s test limit + 40 s use fires, stored under `lastTestWarningDate` only |
+| J. Badge | Orange "5" at 4m50, green "60" after reset, red "0" at limit |
+| K. Blocking | Over-limit YouTube still redirected |
+| L. Permission | `getPermissionLevel()` = granted |
+| M. 5:10 → 0 or over in one step | No notification |
+| N. Active unlock | No notification, and today's warning not used up |
+
 ### Problems found and fixes
 - `showUsage()` once appeared to hang; couldn't reproduce. Found and fixed a related race: `resetUsage()` cleared storage outside the update queue, so a checkpoint could undo the reset.
 - Over-limit blocking only happens at the next event or 30 s checkpoint (Chrome's minimum alarm period), so a site can stay open up to ~30 s past the limit.
@@ -76,3 +104,7 @@ Automated in headless Chrome. Server tests used a temporary copy of the extensio
 - `chrome.action` is undefined unless the manifest has an `"action"` key, so the badge needed that one manifest addition.
 - The badge only sees an unlock when the extension asks `/status` (over the limit on a limited site, or at a checkpoint while over the limit elsewhere). Under the limit nothing is blocked, so it keeps showing minutes left even if an outdoor unlock is active. Usage is saved at 30 s checkpoints, so the badge can lag real time by up to 30 s.
 - Badge tests needed the server to report "unlocked" without touching the real server on 5050 (which was running). Solved by testing a temp copy of the extension with `localhost:5050` replaced by `localhost:5051` and running the real server code on 5051 with temp data.
+- A warning based on "remaining ≤ 5 min" alone would fire when the limit is lowered or a short test limit is turned on. Fixed by requiring a crossing caused by tracked time, compared against one limit.
+- `setTestLimit(300)` can never trigger the warning (it starts at exactly 5:00, not above). Use a test limit above 300 s, e.g. 330.
+- Chrome notifications require an icon and the extension has none; a green circle is generated in code instead of adding image files.
+- If the user lowers the limit below 5 minutes left, they get no warning that day. That is intentional (no false warning from a setting change).
