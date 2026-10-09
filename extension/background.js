@@ -23,6 +23,11 @@ const STATUS_URL = `${API_BASE_URL}/status`;
 const SERVER_TIMEOUT_MS = 3000;
 const BLOCKED_PAGE_URL = chrome.runtime.getURL("blocked.html");
 
+const BADGE_GREEN = "#2e7d32"; // more than 5 minutes left
+const BADGE_ORANGE = "#f57c00"; // 1–5 minutes left
+const BADGE_RED = "#c62828"; // limit reached
+const BADGE_WARNING_SECONDS = 5 * 60;
+
 // ---------- Helpers ----------
 
 // Returns which of `sites` a URL belongs to,
@@ -146,6 +151,7 @@ async function sync(reason) {
 
   await chrome.storage.local.set({ usage, session: nextSession });
   return {
+    reason,
     activeTab,
     totalSeconds: usage.totalSeconds,
     sites,
@@ -157,6 +163,7 @@ async function sync(reason) {
 
 // True only if the server clearly says unlocked. Anything else
 // (locked, error, timeout, bad JSON) counts as locked: fail closed.
+// The answer is remembered for the badge (see rememberUnlock).
 async function isUnlocked() {
   console.log(`Checking server status (${STATUS_URL})`);
   try {
@@ -168,19 +175,40 @@ async function isUnlocked() {
     const data = await res.json();
     if (data.unlocked === true) {
       console.log(`Server reports unlocked (until ${data.until})`);
+      await rememberUnlock(data.until);
       return true;
     }
     console.log("Server reports locked");
-    return false;
   } catch (err) {
     console.log(`Server unreachable - treating as locked (${err.message})`);
-    return false;
   }
+  await rememberUnlock(null);
+  return false;
+}
+
+// Saves when the current unlock ends (0 = not unlocked) in session storage,
+// which survives worker restarts but is cleared when Chrome closes. The
+// server sends local time without a zone, e.g. "2026-10-08T15:30:00".
+async function rememberUnlock(until) {
+  let untilMs = 0;
+  if (until) {
+    const parsed = Date.parse(until);
+    // Unknown end time: trust it until the next checkpoint re-checks.
+    untilMs = Number.isFinite(parsed) ? parsed : Date.now() + CHECKPOINT_MINUTES * 60 * 1000;
+  }
+  await chrome.storage.session.set({ unlockedUntil: untilMs });
 }
 
 async function enforceLimit(result) {
-  const { activeTab, totalSeconds, sites, limit } = result;
-  if (!activeTab || totalSeconds < limit.seconds) return;
+  const { reason, activeTab, totalSeconds, sites, limit } = result;
+  if (totalSeconds < limit.seconds) return;
+
+  if (!activeTab) {
+    // Nothing to block right now. At checkpoints, refresh the unlock state
+    // anyway so the badge notices an unlock started from the phone.
+    if (reason === "checkpoint") await isUnlocked();
+    return;
+  }
 
   console.log(
     `Daily limit reached (${totalSeconds}s / ${limit.label}) on ${activeTab.site}`
@@ -203,13 +231,43 @@ async function enforceLimit(result) {
   await chrome.tabs.update(activeTab.tabId, { url: blockedUrl });
 }
 
-// Run syncs (and the limit check after each) one at a time so overlapping
-// events can't overwrite each other.
+// ---------- Badge: minutes left today on the toolbar icon ----------
+
+// Shows remaining minutes (rounded up), coloured by how close the limit is.
+// Hidden while the server has unlocked the user.
+async function updateBadge(result) {
+  const { totalSeconds, limit } = result;
+  const { unlockedUntil = 0 } = await chrome.storage.session.get("unlockedUntil");
+
+  if (unlockedUntil > Date.now()) {
+    await chrome.action.setBadgeText({ text: "" });
+    return;
+  }
+
+  const remaining = Math.max(0, limit.seconds - totalSeconds);
+  const color =
+    remaining === 0
+      ? BADGE_RED
+      : remaining <= BADGE_WARNING_SECONDS
+        ? BADGE_ORANGE
+        : BADGE_GREEN;
+  await chrome.action.setBadgeText({ text: String(Math.ceil(remaining / 60)) });
+  await chrome.action.setBadgeBackgroundColor({ color });
+}
+
+// Run syncs (then the limit check and badge update after each) one at a
+// time so overlapping events can't overwrite each other.
 let queue = Promise.resolve();
 function schedule(reason) {
   queue = queue
     .then(() => sync(reason))
-    .then(enforceLimit)
+    .then(async (result) => {
+      try {
+        await enforceLimit(result);
+      } finally {
+        await updateBadge(result);
+      }
+    })
     .catch((err) => console.error(err));
   return queue;
 }
@@ -295,6 +353,8 @@ globalThis.showUsage = async () => {
   console.table(usage.sites);
   console.log("Current session:", session);
   console.log("Blocked sites:", settings.blockedSites);
+  const badge = await chrome.action.getBadgeText({});
+  console.log(`Badge: ${badge === "" ? "(hidden – unlocked)" : badge}`);
   return usage;
 };
 
