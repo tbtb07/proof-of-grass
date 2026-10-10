@@ -1,0 +1,6 @@
+flask
+ollama
+pillow
+pillow-heif
+qrcode
+werkzeug

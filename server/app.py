@@ -1,8 +1,10 @@
+import io
 import socket
 import time
 from datetime import timedelta
 
-from flask import Flask, jsonify, render_template, request
+import qrcode
+from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.security import check_password_hash
 
 import store
@@ -20,6 +22,10 @@ def get_local_ip() -> str:
         return "127.0.0.1"
     finally:
         sock.close()
+
+
+def get_phone_url() -> str:
+    return f"http://{get_local_ip()}:5050"
 
 
 @app.route("/")
@@ -247,8 +253,20 @@ def status():
     return jsonify({
         "unlocked": unlocked,
         "until": until,
-        "phone_url": f"http://{get_local_ip()}:5050",
+        "phone_url": get_phone_url(),
     })
+
+
+@app.route("/qr.png")
+def qr_png():
+    img = qrcode.make(get_phone_url())
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    response = send_file(buffer, mimetype="image/png")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 if __name__ == "__main__":

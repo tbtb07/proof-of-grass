@@ -26,6 +26,7 @@ const BLOCKED_PAGE_URL = chrome.runtime.getURL("blocked.html");
 const BADGE_GREEN = "#2e7d32"; // more than 5 minutes left
 const BADGE_ORANGE = "#f57c00"; // 1–5 minutes left
 const BADGE_RED = "#c62828"; // limit reached
+const BADGE_BLUE = "#1565c0"; // outdoor-break unlock active: minutes left in the unlock
 const BADGE_WARNING_SECONDS = 5 * 60;
 
 const WARNING_SECONDS = 5 * 60;
@@ -34,6 +35,12 @@ const WARNING_TITLE = "Proof of Grass — 5 Minutes Left!";
 const WARNING_MESSAGE =
   "You have 5 minutes of screen time remaining today. " +
   "Finish up before your websites are blocked!";
+
+const UNLOCK_ENDING_SECONDS = 5 * 60;
+const UNLOCK_ENDING_NOTIFICATION_ID = "unlock-ending-warning";
+const UNLOCK_ENDING_TITLE = "Proof of Grass — Unlock Ending Soon";
+const UNLOCK_ENDING_MESSAGE =
+  "Your outdoor-break unlock ends in 5 minutes.";
 
 // ---------- Helpers ----------
 
@@ -218,16 +225,17 @@ async function rememberUnlock(until) {
   await chrome.storage.session.set({ unlockedUntil: untilMs });
 }
 
-async function enforceLimit(result) {
-  const { reason, activeTab, totalSeconds, sites, limit } = result;
-  if (totalSeconds < limit.seconds) return;
+// Keeps the remembered unlock state fresh every checkpoint (30s), whether or
+// not today's limit has been reached. An outdoor break can unlock the user
+// before they ever hit the limit, and the badge/notification below both need
+// to notice that even though enforceLimit() has nothing to block yet.
+async function refreshUnlockStatus(reason) {
+  if (reason === "checkpoint") await isUnlocked();
+}
 
-  if (!activeTab) {
-    // Nothing to block right now. At checkpoints, refresh the unlock state
-    // anyway so the badge notices an unlock started from the phone.
-    if (reason === "checkpoint") await isUnlocked();
-    return;
-  }
+async function enforceLimit(result) {
+  const { activeTab, totalSeconds, sites, limit } = result;
+  if (totalSeconds < limit.seconds || !activeTab) return;
 
   console.log(
     `Daily limit reached (${totalSeconds}s / ${limit.label}) on ${activeTab.site}`
@@ -250,16 +258,21 @@ async function enforceLimit(result) {
   await chrome.tabs.update(activeTab.tabId, { url: blockedUrl });
 }
 
-// ---------- Badge: minutes left today on the toolbar icon ----------
+// ---------- Badge: minutes left today, or minutes left in an unlock ----------
 
-// Shows remaining minutes (rounded up), coloured by how close the limit is.
-// Hidden while the server has unlocked the user.
+// While an outdoor-break unlock is active, shows minutes left in the unlock
+// (blue) instead of today's remaining time, so it's clear when sites will
+// lock again. Otherwise shows remaining minutes today (rounded up),
+// coloured by how close the daily limit is.
 async function updateBadge(result) {
   const { totalSeconds, limit } = result;
   const { unlockedUntil = 0 } = await chrome.storage.session.get("unlockedUntil");
+  const now = Date.now();
 
-  if (unlockedUntil > Date.now()) {
-    await chrome.action.setBadgeText({ text: "" });
+  if (unlockedUntil > now) {
+    const minutesLeft = Math.ceil((unlockedUntil - now) / 60000);
+    await chrome.action.setBadgeText({ text: String(minutesLeft) });
+    await chrome.action.setBadgeBackgroundColor({ color: BADGE_BLUE });
     return;
   }
 
@@ -304,7 +317,7 @@ async function maybeWarn(result) {
 async function showWarning() {
   await chrome.notifications.create(WARNING_NOTIFICATION_ID, {
     type: "basic",
-    iconUrl: await warningIconUrl(),
+    iconUrl: await notificationIconUrl(BADGE_GREEN),
     title: WARNING_TITLE,
     message: WARNING_MESSAGE,
     priority: 2,
@@ -312,12 +325,12 @@ async function showWarning() {
 }
 
 // The extension has no icon files yet, and Chrome requires an icon for a
-// notification, so draw a simple green circle. Replace with a real icon file
-// once the extension has one.
-async function warningIconUrl() {
+// notification, so draw a simple circle in the given colour. Replace with a
+// real icon file once the extension has one.
+async function notificationIconUrl(color) {
   const canvas = new OffscreenCanvas(128, 128);
   const ctx = canvas.getContext("2d");
-  ctx.fillStyle = BADGE_GREEN;
+  ctx.fillStyle = color;
   ctx.beginPath();
   ctx.arc(64, 64, 60, 0, Math.PI * 2);
   ctx.fill();
@@ -328,19 +341,49 @@ async function warningIconUrl() {
   return `data:image/png;base64,${btoa(binary)}`;
 }
 
-// Run syncs (then the limit check, badge and warning after each) one at a
-// time so overlapping events can't overwrite each other.
+// ---------- Unlock-ending warning notification ----------
+
+// Shows once per unlock, when 5 minutes or less remain in it. Dedupes on the
+// unlock's own end time (session storage), so a later, longer unlock gets
+// its own warning, and the memory clears along with the unlock when Chrome
+// closes. Reusing refreshUnlockStatus's checkpoint cadence (30s) means this
+// can lag the true 5-minute mark by up to that long, same as the badge.
+async function maybeWarnUnlockEnding() {
+  const { unlockedUntil = 0 } = await chrome.storage.session.get("unlockedUntil");
+  if (!unlockedUntil) return;
+
+  const remainingMs = unlockedUntil - Date.now();
+  if (remainingMs <= 0 || remainingMs > UNLOCK_ENDING_SECONDS * 1000) return;
+
+  const { notifiedUnlockUntil } = await chrome.storage.session.get("notifiedUnlockUntil");
+  if (notifiedUnlockUntil === unlockedUntil) return;
+
+  await chrome.storage.session.set({ notifiedUnlockUntil: unlockedUntil });
+  await chrome.notifications.create(UNLOCK_ENDING_NOTIFICATION_ID, {
+    type: "basic",
+    iconUrl: await notificationIconUrl(BADGE_BLUE),
+    title: UNLOCK_ENDING_TITLE,
+    message: UNLOCK_ENDING_MESSAGE,
+    priority: 2,
+  });
+  console.log(`Unlock-ending warning shown (${Math.ceil(remainingMs / 60000)}m left).`);
+}
+
+// Run syncs (then the unlock refresh, limit check, badge and warnings after
+// each) one at a time so overlapping events can't overwrite each other.
 let queue = Promise.resolve();
 function schedule(reason) {
   queue = queue
     .then(() => sync(reason))
     .then(async (result) => {
       try {
+        await refreshUnlockStatus(reason);
         await enforceLimit(result);
       } finally {
         await updateBadge(result);
-        // The warning must never break blocking or the badge.
+        // Warnings must never break blocking or the badge.
         await maybeWarn(result).catch((err) => console.error("Warning failed:", err));
+        await maybeWarnUnlockEnding().catch((err) => console.error("Unlock warning failed:", err));
       }
     })
     .catch((err) => console.error(err));
@@ -429,7 +472,9 @@ globalThis.showUsage = async () => {
   console.log("Current session:", session);
   console.log("Blocked sites:", settings.blockedSites);
   const badge = await chrome.action.getBadgeText({});
-  console.log(`Badge: ${badge === "" ? "(hidden – unlocked)" : badge}`);
+  const { unlockedUntil = 0 } = await chrome.storage.session.get("unlockedUntil");
+  const badgeKind = unlockedUntil > Date.now() ? "unlock minutes left" : "daily minutes left";
+  console.log(`Badge: ${badge} (${badgeKind})`);
   return usage;
 };
 
@@ -457,6 +502,20 @@ globalThis.clearTestLimit = async () => {
 // it doesn't record anything, so today's real warning still works.
 globalThis.testWarning = async () => {
   await showWarning();
+  console.log("Test notification shown (nothing recorded).");
+};
+
+// testUnlockWarning() -> shows the unlock-ending notification right now.
+// Preview only: it doesn't touch notifiedUnlockUntil, so the real one-time
+// warning for any actual active unlock still works.
+globalThis.testUnlockWarning = async () => {
+  await chrome.notifications.create(UNLOCK_ENDING_NOTIFICATION_ID, {
+    type: "basic",
+    iconUrl: await notificationIconUrl(BADGE_BLUE),
+    title: UNLOCK_ENDING_TITLE,
+    message: UNLOCK_ENDING_MESSAGE,
+    priority: 2,
+  });
   console.log("Test notification shown (nothing recorded).");
 };
 
